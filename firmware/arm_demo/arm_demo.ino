@@ -6,9 +6,16 @@
 //   lim s 600 2100  set a joint's limits            home s 600      set a joint's home
 //   home            move every joint home
 //   save 3, go 3    store / recall pose slot 3 (0-19)                clear   delete all poses
-//   play, loop      run the saved poses in order, once or repeating  stop    end playback
+//   play, loop      run the saved poses in order, once or repeating  stop    stop where it is
 //   speed 600       top joint speed in us/s (50-3000)                dwell 500   pause at each pose, ms
 //   off, off s      all joints limp / one joint limp                 on      power all joints at their targets
+//   rest 400        how long the yaw (and the open gripper) waits before its pulses stop, ms
+//   ease 3, ease 5  cubic or quintic easing; quintic also ramps the acceleration, about 25% slower at equal speed
+//
+// Paths: queue waypoints, then run them as one continuous motion. Joints left out of a waypoint keep their value
+// from the one before. "ms" sets a segment's time, "v" its top speed; a waypoint with only "ms" is a pause.
+//   wp s 1438 e 1860 v 350    wp ms 500    run    wpclear
+// "path done" is printed when a path finishes.
 //
 // Limits, homes and poses are kept in flash, so they survive a reset.
 //
@@ -16,8 +23,8 @@
 // straight to the target instead of ramping. Move the arm close to that position by hand first.
 
 #include <Preferences.h>
+#include "motion.h"
 
-const int JOINT_COUNT = 5;
 const char JOINT_KEYS[JOINT_COUNT] = {'y', 's', 'e', 'w', 'g'};
 const int PINS[JOINT_COUNT] = {27, 26, 25, 33, 32};
 const int YAW = 0, GRIP = 4;
@@ -28,15 +35,16 @@ const uint32_t PERIOD_US = 1000000UL / PWM_FREQ_HZ;
 const uint32_t FRAME_MS = 20;
 const int POSE_SLOTS = 20;
 
-// The yaw and gripper stop getting pulses shortly after each move. The yaw carries no gravity load and its gearbox
-// holds the turret still, so this stops it hunting back and forth in the gear backlash. The gripper's gearbox
+// The yaw and gripper stop getting pulses once they've been still for a moment. The yaw carries no gravity load and
+// its gearbox holds the turret, so this stops it hunting back and forth in the gear backlash. The gripper's gearbox
 // friction keeps hold of an object, so a squeeze or a jam only stalls the servo for GRIP_HOLD_MS.
-const uint32_t REST_MS = 400;
+uint32_t rest_ms = 400;
 const uint32_t GRIP_HOLD_MS = 1500;
+int ease_order = 3;
 
 int limit_lo[JOINT_COUNT], limit_hi[JOINT_COUNT], home_us[JOINT_COUNT];
-float current_us[JOINT_COUNT], start_us[JOINT_COUNT];
-int target_us[JOINT_COUNT];
+float current_us[JOINT_COUNT];
+int target_us[JOINT_COUNT];  // where the current motion ends
 bool powered[JOINT_COUNT];   // false = limp
 bool resting[JOINT_COUNT];   // powered, but pulses paused (yaw and gripper)
 uint32_t rest_at_ms[JOINT_COUNT] = {0};
@@ -45,11 +53,16 @@ int poses[POSE_SLOTS][JOINT_COUNT];
 bool pose_used[POSE_SLOTS];
 
 int speed_us_per_s = 600, dwell_ms = 500;
+
+Path active;    // the motion being run
+Path pending;   // waypoints queued with "wp"
+bool pending_set[JOINT_COUNT];
 bool moving = false;
-uint32_t move_start_ms = 0, move_ms = 0;
-int play_index = -1;   // -1 when not playing
+bool path_command = false;  // the active path came from "run", so report when it ends
+bool playing = false;       // the active path is the saved poses
 bool looping = false;
-uint32_t dwell_until_ms = 0;
+int segment = 0;
+uint32_t segment_start_ms = 0;
 
 Preferences prefs;
 
@@ -77,32 +90,46 @@ void save_settings() {
   prefs.putBytes("used", pose_used, sizeof pose_used);
 }
 
-// Moves every powered joint from where it is to its target, all arriving at the same time. The motion follows a
-// smoothstep curve so it starts and stops gently. Smoothstep peaks at 1.5x the average speed, so the move time is
-// picked to keep the joint with the furthest to go at speed_us_per_s.
-void start_move() {
-  int furthest = 0;
-  for (int i = 0; i < JOINT_COUNT; i++) {
-    // A resting joint only wakes up if its own target changed, so the yaw stays quiet and the gripper keeps its
-    // grip while the other joints move.
-    if (resting[i] && target_us[i] != rounded(current_us[i])) {
-      resting[i] = false;
-      write_pulse(i);
-    }
-    start_us[i] = current_us[i];
-    if (powered[i]) furthest = max(furthest, abs(target_us[i] - (int)current_us[i]));
-  }
-  move_ms = (uint32_t)furthest * 1500UL / speed_us_per_s;
-  move_start_ms = millis();
-  moving = true;
-  rest_at_ms[YAW] = rest_at_ms[GRIP] = 0;
-}
-
 // Powers a limp joint. Its real position is unknown, so it jumps to `us` instead of ramping.
 void power_on_at(int i, int us) {
   powered[i] = true;
-  current_us[i] = start_us[i] = us;
+  current_us[i] = us;
   write_pulse(i);
+}
+
+// Starts `active` from where the arm is now. Waypoint 0 must already hold the start positions.
+void run_active(bool from_run_command) {
+  plan_path(active, speed_us_per_s);
+  for (int i = 0; i < JOINT_COUNT; i++) target_us[i] = rounded(active.us[active.count - 1][i]);
+  path_command = from_run_command;
+  if (active.count < 2) {
+    moving = false;
+    if (path_command) Serial.println("path done");
+    return;
+  }
+  uint32_t total = 0;
+  for (int k = 1; k < active.count; k++) total += active.ms[k];
+  if (from_run_command) Serial.printf("path: %d waypoints, %lu ms\n", active.count - 1, (unsigned long)total);
+  segment = 1;
+  segment_start_ms = millis();
+  moving = true;
+}
+
+void start_active_at_current() {
+  active.count = 1;
+  active.ease = ease_order;
+  for (int i = 0; i < JOINT_COUNT; i++) active.us[0][i] = current_us[i];
+}
+
+// One eased move from where every joint is to target_us[], all joints arriving together.
+void move_to_targets() {
+  looping = playing = false;
+  start_active_at_current();
+  for (int i = 0; i < JOINT_COUNT; i++) active.us[1][i] = powered[i] ? target_us[i] : current_us[i];
+  active.ms[1] = 0;
+  active.speed[1] = 0;
+  active.count = 2;
+  run_active(false);
 }
 
 void set_joint(int i, int us) {
@@ -114,37 +141,127 @@ void set_joint(int i, int us) {
     power_on_at(i, clamped);
     Serial.printf("%c: pulses on at %d us\n", JOINT_KEYS[i], clamped);
   }
-  start_move();
+  move_to_targets();
 }
 
-void go_to_pose(int k) {
+void go_to(const int *us) {
   for (int i = 0; i < JOINT_COUNT; i++) {
-    target_us[i] = constrain(poses[k][i], limit_lo[i], limit_hi[i]);
+    target_us[i] = constrain(us[i], limit_lo[i], limit_hi[i]);
     if (!powered[i]) power_on_at(i, target_us[i]);
   }
-  start_move();
-  Serial.printf("-> pose %d\n", k);
-}
-
-void go_home() {
-  for (int i = 0; i < JOINT_COUNT; i++) {
-    target_us[i] = home_us[i];
-    if (!powered[i]) power_on_at(i, target_us[i]);
-  }
-  start_move();
-  Serial.println("-> home");
-}
-
-void stop_playback() {
-  if (play_index >= 0) Serial.println("stopped");
-  play_index = -1;
-  looping = false;
+  move_to_targets();
 }
 
 int next_pose(int from) {
   for (int k = from; k < POSE_SLOTS; k++)
     if (pose_used[k]) return k;
   return -1;
+}
+
+// Saved poses in order as one path, with a pause of dwell_ms at each. With no dwell the arm flows through them.
+void play_poses() {
+  int first = next_pose(0);
+  for (int i = 0; i < JOINT_COUNT; i++)
+    if (!powered[i]) power_on_at(i, constrain(poses[first][i], limit_lo[i], limit_hi[i]));
+  start_active_at_current();
+  for (int k = first; k < POSE_SLOTS; k++) {
+    if (!pose_used[k] || active.count > MAX_WAYPOINTS - 2) continue;
+    int n = active.count;
+    for (int i = 0; i < JOINT_COUNT; i++) active.us[n][i] = constrain(poses[k][i], limit_lo[i], limit_hi[i]);
+    active.ms[n] = 0;
+    active.speed[n] = 0;
+    active.count++;
+    if (dwell_ms > 0) {
+      for (int i = 0; i < JOINT_COUNT; i++) active.us[n + 1][i] = active.us[n][i];
+      active.ms[n + 1] = dwell_ms;
+      active.speed[n + 1] = 0;
+      active.count++;
+    }
+  }
+  run_active(false);
+  playing = true;
+}
+
+void stop_motion() {
+  bool was_moving = moving || looping;
+  moving = false;
+  looping = playing = false;
+  for (int i = 0; i < JOINT_COUNT; i++) target_us[i] = rounded(current_us[i]);
+  if (was_moving) Serial.println("stopped");
+}
+
+// "wp" arguments: pairs of a joint key and a pulse, plus optional "ms N" and "v N".
+void queue_waypoint(String arg) {
+  if (pending.count == 0) {
+    pending.count = 1;
+    for (int i = 0; i < JOINT_COUNT; i++) {
+      pending.us[0][i] = powered[i] ? target_us[i] : current_us[i];
+      pending_set[i] = false;
+    }
+  }
+  if (pending.count >= MAX_WAYPOINTS) {
+    Serial.println("path full");
+    return;
+  }
+  int n = pending.count;
+  for (int i = 0; i < JOINT_COUNT; i++) pending.us[n][i] = pending.us[n - 1][i];
+  pending.ms[n] = 0;
+  pending.speed[n] = 0;
+
+  arg.trim();
+  while (arg.length()) {
+    int space = arg.indexOf(' ');
+    if (space < 0) {
+      Serial.println("wp: every key needs a value");
+      return;
+    }
+    String key = arg.substring(0, space);
+    arg = arg.substring(space + 1);
+    arg.trim();
+    space = arg.indexOf(' ');
+    int value = (space < 0 ? arg : arg.substring(0, space)).toInt();
+    arg = space < 0 ? "" : arg.substring(space + 1);
+    arg.trim();
+
+    int j = key.length() == 1 ? joint_of(key[0]) : -1;
+    if (j >= 0) {
+      value = constrain(value, limit_lo[j], limit_hi[j]);
+      // A limp joint jumps when the path starts, so it sits at its first value from the start.
+      if (!powered[j] && !pending_set[j])
+        for (int k = 0; k < n; k++) pending.us[k][j] = value;
+      pending_set[j] = true;
+      pending.us[n][j] = value;
+    } else if (key == "ms") {
+      pending.ms[n] = max(0, value);
+    } else if (key == "v") {
+      pending.speed[n] = constrain(value, 50, 3000);
+    } else {
+      Serial.printf("wp: unknown key %s\n", key.c_str());
+      return;
+    }
+  }
+  pending.count++;
+}
+
+void run_pending() {
+  if (pending.count < 2) {
+    Serial.println("no waypoints queued");
+    return;
+  }
+  looping = playing = false;
+  active = pending;
+  active.ease = ease_order;
+  pending.count = 0;
+  for (int i = 0; i < JOINT_COUNT; i++) {
+    if (powered[i]) {
+      active.us[0][i] = current_us[i];
+    } else if (pending_set[i]) {
+      power_on_at(i, rounded(active.us[0][i]));
+    } else {
+      for (int k = 0; k < active.count; k++) active.us[k][i] = current_us[i];
+    }
+  }
+  run_active(true);
 }
 
 // The control panel parses this output, so keep the format in sync with tools/arm_ui/arm_ui.py.
@@ -173,7 +290,6 @@ int nudge_amount(const String &suffix) {
 void handle_command(String cmd) {
   cmd.trim();
   if (cmd.length() == 0) return;
-  if (cmd != "p") stop_playback();   // p only reports, so the panel can poll it during playback
 
   String word = cmd, arg = "";
   int space = cmd.indexOf(' ');
@@ -191,8 +307,15 @@ void handle_command(String cmd) {
     set_joint(j, (powered[j] ? target_us[j] : home_us[j]) + nudge);
   } else if (word == "p") {
     print_status();
+  } else if (word == "wp") {
+    queue_waypoint(arg);
+  } else if (word == "wpclear") {
+    pending.count = 0;
+    Serial.println("waypoints cleared");
+  } else if (word == "run") {
+    run_pending();
   } else if (word == "stop") {
-    // stop_playback() above already did it
+    stop_motion();
   } else if (word == "lim") {
     int k = joint_of(arg[0]);
     int second_space = arg.indexOf(' ', 2);
@@ -219,7 +342,8 @@ void handle_command(String cmd) {
     save_settings();
     Serial.printf("%c home %d\n", JOINT_KEYS[k], home_us[k]);
   } else if (word == "home") {
-    go_home();
+    go_to(home_us);
+    Serial.println("-> home");
   } else if (word == "save") {
     int k = arg.toInt();
     if (!arg.length() || k < 0 || k >= POSE_SLOTS) {
@@ -236,20 +360,28 @@ void handle_command(String cmd) {
     Serial.println("poses cleared");
   } else if (word == "go") {
     int k = arg.toInt();
-    if (k >= 0 && k < POSE_SLOTS && pose_used[k]) go_to_pose(k);
-    else Serial.println("no such pose");
+    if (k >= 0 && k < POSE_SLOTS && pose_used[k]) {
+      go_to(poses[k]);
+      Serial.printf("-> pose %d\n", k);
+    } else {
+      Serial.println("no such pose");
+    }
   } else if (word == "play" || word == "loop") {
-    play_index = next_pose(0);
-    if (play_index < 0) {
+    if (next_pose(0) < 0) {
       Serial.println("no poses saved");
       return;
     }
+    play_poses();
     looping = word == "loop";
-    dwell_until_ms = 0;
-    go_to_pose(play_index);
   } else if (word == "speed") {
     if (arg.length()) speed_us_per_s = constrain((int)arg.toInt(), 50, 3000);
     Serial.printf("speed %d us/s\n", speed_us_per_s);
+  } else if (word == "rest") {
+    if (arg.length()) rest_ms = constrain((int)arg.toInt(), 0, 5000);
+    Serial.printf("rest %lu ms\n", (unsigned long)rest_ms);
+  } else if (word == "ease") {
+    if (arg == "3" || arg == "5") ease_order = arg.toInt();
+    Serial.printf("ease %d\n", ease_order);
   } else if (word == "dwell") {
     dwell_ms = max(0, (int)arg.toInt());
     Serial.printf("dwell %d ms\n", dwell_ms);
@@ -261,13 +393,14 @@ void handle_command(String cmd) {
       Serial.printf("%c limp\n", JOINT_KEYS[k]);
     }
   } else if (word == "off") {
-    moving = false;
+    moving = looping = playing = false;
     for (int i = 0; i < JOINT_COUNT; i++) {
       powered[i] = resting[i] = false;
       write_pulse(i);
     }
     Serial.println("all limp");
   } else if (word == "on") {
+    moving = looping = playing = false;
     for (int i = 0; i < JOINT_COUNT; i++) {
       powered[i] = true;
       resting[i] = false;
@@ -276,7 +409,7 @@ void handle_command(String cmd) {
     }
     Serial.println("all on at their targets");
   } else {
-    Serial.println("? y/s/e/w/g <us> | s+ s- s++ s-- | p | lim | home | save N | go N | play | loop | stop | speed | dwell | off | on");
+    Serial.println("? y/s/e/w/g <us> | s+ s- s++ s-- | p | lim | home | save N | go N | play | loop | stop | speed | dwell | rest | ease | wp | run | wpclear | off | on");
   }
 }
 
@@ -296,13 +429,38 @@ void setup() {
   prefs.getBytes("used", pose_used, sizeof pose_used);
 
   for (int i = 0; i < JOINT_COUNT; i++) {
-    current_us[i] = start_us[i] = target_us[i] = home_us[i];
+    current_us[i] = target_us[i] = home_us[i];
     powered[i] = resting[i] = false;
     ledcAttach(PINS[i], PWM_FREQ_HZ, PWM_RES_BITS);
     write_pulse(i);
   }
   delay(200);
   Serial.println("\nSAM ready, all joints limp. 'p' lists them.");
+}
+
+// The yaw and gripper rest once they've been still for a moment, and wake as soon as the path moves them again.
+void update_rest(uint32_t now) {
+  for (int i : {YAW, GRIP}) {
+    bool still = !moving || !joint_moves(active, segment, i);
+    if (!still) {
+      rest_at_ms[i] = 0;
+      if (resting[i]) {
+        resting[i] = false;
+        write_pulse(i);
+      }
+      continue;
+    }
+    if (!powered[i] || resting[i]) continue;
+    if (rest_at_ms[i] == 0) {
+      // nothing to hold at the gripper's open limit, so it can rest right away there
+      bool holding = i == GRIP && rounded(current_us[i]) < limit_hi[i];
+      rest_at_ms[i] = now + (holding ? GRIP_HOLD_MS : rest_ms);
+    } else if ((int32_t)(now - rest_at_ms[i]) >= 0) {
+      rest_at_ms[i] = 0;
+      resting[i] = true;
+      write_pulse(i);
+    }
+  }
 }
 
 void loop() {
@@ -318,42 +476,31 @@ void loop() {
   }
 
   static uint32_t last_frame_ms = 0;
-  if (moving && millis() - last_frame_ms >= FRAME_MS) {
-    last_frame_ms = millis();
-    float t = move_ms == 0 ? 1.0f : min(1.0f, (float)(millis() - move_start_ms) / move_ms);
-    float eased = t * t * (3.0f - 2.0f * t);   // smoothstep
+  uint32_t now = millis();
+  if (now - last_frame_ms < FRAME_MS) return;
+  last_frame_ms = now;
+
+  if (moving) {
+    uint32_t t = now - segment_start_ms;
+    while (moving && t >= active.ms[segment]) {
+      t -= active.ms[segment];
+      segment_start_ms += active.ms[segment];
+      if (++segment >= active.count) moving = false;
+    }
     for (int i = 0; i < JOINT_COUNT; i++) {
       if (!powered[i]) continue;
-      current_us[i] = start_us[i] + (target_us[i] - start_us[i]) * eased;
+      current_us[i] = moving ? path_position(active, segment, t, i) : active.us[active.count - 1][i];
       write_pulse(i);
     }
-    if (t >= 1.0f) {
-      moving = false;
-      dwell_until_ms = millis() + dwell_ms;
-      rest_at_ms[YAW] = millis() + REST_MS;
-      // nothing to hold at the open limit, so the gripper can rest right away there
-      rest_at_ms[GRIP] = millis() + (target_us[GRIP] >= limit_hi[GRIP] ? REST_MS : GRIP_HOLD_MS);
+    if (!moving) {
+      if (path_command) Serial.println("path done");
+      if (playing && looping) {
+        play_poses();
+      } else if (playing) {
+        playing = false;
+        Serial.println("done");
+      }
     }
   }
-
-  for (int i : {YAW, GRIP}) {
-    if (moving || !rest_at_ms[i] || millis() < rest_at_ms[i]) continue;
-    rest_at_ms[i] = 0;
-    if (powered[i] && !resting[i]) {
-      resting[i] = true;
-      write_pulse(i);
-    }
-  }
-
-  if (!moving && play_index >= 0 && millis() >= dwell_until_ms) {
-    int k = next_pose(play_index + 1);
-    if (k < 0 && looping) k = next_pose(0);
-    if (k < 0) {
-      Serial.println("done");
-      play_index = -1;
-    } else {
-      play_index = k;
-      go_to_pose(k);
-    }
-  }
+  update_rest(now);
 }
