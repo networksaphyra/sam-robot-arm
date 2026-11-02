@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="#videos">▶ Videos</a> ·
+  <a href="https://www.youtube.com/watch?v=F5q1DYrK8Ag">YouTube</a> ·
   <a href="https://a360.co/4irzr3U">3D model in your browser</a>
 </p>
 
